@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Jupyter Checkpoints
+.ipynb_checkpoints/
+
+# SQLite database (too large for GitHub)
+olist.db
+
+# Environment
+.env
+.venv/
+venv/
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
