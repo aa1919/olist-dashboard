@@ -19,12 +19,151 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==================== 数据加载 ====================
+# ==================== 数据加载（含自动建库） ====================
+DB_PATH = os.path.join(os.path.dirname(__file__), "olist.db")
+
+
+@st.cache_data(ttl=3600)
+def _read_csv(name):
+    """读取单个 CSV 文件"""
+    path = os.path.join(os.path.dirname(__file__), name)
+    return pd.read_csv(path)
+
+
+def _build_fact_order():
+    """
+    从 CSV 原始数据构建 fact_order 宽表并写入 SQLite。
+    仅在 olist.db 不存在或缺少 fact_order 表时执行，Streamlit Cloud 部署时自动触发。
+    """
+    print("[BUILD] 开始从 CSV 构建数据库...")
+
+    # 1. 读取所有原始表
+    orders = _read_csv("olist_orders_dataset.csv")
+    order_items = _read_csv("olist_order_items_dataset.csv")
+    order_pay = _read_csv("olist_order_payments_dataset.csv")
+    products = _read_csv("olist_products_dataset.csv")
+    customers = _read_csv("olist_customers_dataset.csv")
+    sellers = _read_csv("olist_sellers_dataset.csv")
+    cat_trans = _read_csv("product_category_name_translation.csv")
+
+    # 2. 写入原始表到 SQLite（方便后续复用）
+    tables = {
+        "orders": orders, "order_items": order_items,
+        "order_payments": order_pay, "products": products,
+        "customers": customers, "sellers": sellers,
+        "category_trans": cat_trans,
+    }
+    conn = sqlite3.connect(DB_PATH)
+    for name, df in tables.items():
+        df.to_sql(name, conn, if_exists="replace", index=False)
+
+    # 3. 日期字段转换
+    date_cols = ['order_purchase_timestamp', 'order_approved_at',
+                 'order_delivered_carrier_date', 'order_delivered_customer_date',
+                 'order_estimated_delivery_date']
+    for col in date_cols:
+        orders[col] = pd.to_datetime(orders[col], errors='coerce')
+    p = orders['order_purchase_timestamp']
+    orders['purchase_year'] = p.dt.year
+    orders['purchase_month'] = p.dt.month
+    orders['purchase_quarter'] = p.dt.quarter
+    orders['purchase_weekday'] = p.dt.day_name()
+    orders['purchase_ym'] = p.dt.strftime('%Y-%m')
+    orders['logistics_days'] = (orders['order_delivered_customer_date'] - p).dt.days
+    orders['order_status_cn'] = orders['order_status'].apply(
+        lambda s: '已完成' if s == 'delivered' else ('已取消' if s == 'canceled' else '其他')
+    )
+
+    # 4. 订单级聚合
+    order_agg = order_items.groupby('order_id').agg(
+        order_item_count=('order_item_id', 'count'),
+        order_total_price=('price', 'sum'),
+        order_freight=('freight_value', 'sum'),
+    ).reset_index()
+    order_agg['order_total_amount'] = order_agg['order_total_price'] + order_agg['order_freight']
+
+    # 5. 客户 RFM 统计
+    cp = orders[['order_id', 'customer_id', 'order_purchase_timestamp']].merge(
+        order_agg[['order_id', 'order_total_amount']], on='order_id', how='inner'
+    )
+    customer_stats = cp.groupby('customer_id').agg(
+        first_purchase_date=('order_purchase_timestamp', 'min'),
+        last_purchase_date=('order_purchase_timestamp', 'max'),
+        purchase_frequency=('order_id', 'count'),
+        total_spent=('order_total_amount', 'sum'),
+        avg_order_value=('order_total_amount', 'mean'),
+    ).reset_index()
+
+    # 6. 产品 + 品类翻译
+    products = products.merge(cat_trans, on='product_category_name', how='left')
+    products['product_category_name_english'] = products['product_category_name_english'].fillna('unknown')
+
+    # 7. 构建 fact_order 宽表
+    fact = order_items.copy()
+    order_dim = orders[[
+        'order_id', 'customer_id', 'order_purchase_timestamp',
+        'logistics_days', 'order_status_cn',
+        'purchase_year', 'purchase_month', 'purchase_quarter',
+        'purchase_weekday', 'purchase_ym'
+    ]].copy()
+    order_dim = order_dim.rename(columns={'order_purchase_timestamp': 'purchase_time'})
+    fact = fact.merge(order_dim, on='order_id', how='left')
+    fact = fact.merge(order_agg, on='order_id', how='left')
+
+    first_payment = order_pay[order_pay['payment_sequential'] == 1][
+        ['order_id', 'payment_type', 'payment_installments', 'payment_value']
+    ]
+    fact = fact.merge(first_payment, on='order_id', how='left')
+
+    product_dim = products[['product_id', 'product_category_name_english',
+                             'product_weight_g', 'product_length_cm',
+                             'product_height_cm', 'product_width_cm']]
+    fact = fact.merge(product_dim, on='product_id', how='left')
+
+    seller_dim = sellers[['seller_id', 'seller_city', 'seller_state']]
+    fact = fact.merge(seller_dim, on='seller_id', how='left')
+
+    customer_dim = customers[['customer_id', 'customer_unique_id',
+                               'customer_city', 'customer_state']]
+    fact = fact.merge(customer_dim, on='customer_id', how='left')
+    fact = fact.merge(customer_stats, on='customer_id', how='left')
+
+    # 去重
+    fact = fact.loc[:, ~fact.columns.duplicated(keep='first')]
+
+    # 8. 写入 fact_order 表
+    fact.to_sql('fact_order', conn, if_exists='replace', index=False)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_order_id ON fact_order(order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_customer ON fact_order(customer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_product ON fact_order(product_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_date ON fact_order(purchase_ym)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_category ON fact_order(product_category_name_english)")
+    conn.commit()
+    conn.close()
+
+    print(f"[BUILD] fact_order 构建完成: {len(fact):,} 行, {len(fact.columns)} 列")
+    return fact
+
+
 @st.cache_data(ttl=600)
 def load_data():
-    """从 SQLite 加载 fact_order 宽表并预处理时间字段"""
-    db_path = os.path.join(os.path.dirname(__file__), "olist.db")
-    conn = sqlite3.connect(db_path)
+    """从 SQLite 加载 fact_order 宽表；若表不存在则自动从 CSV 构建"""
+    # 检查是否需要建库
+    need_build = True
+    if os.path.exists(DB_PATH):
+        try:
+            check_conn = sqlite3.connect(DB_PATH)
+            tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table' AND name='fact_order'", check_conn)
+            check_conn.close()
+            if len(tables) > 0:
+                need_build = False
+        except Exception:
+            need_build = True
+
+    if need_build:
+        _build_fact_order()
+
+    conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("SELECT * FROM fact_order", conn)
     conn.close()
 
